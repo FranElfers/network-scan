@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -296,21 +297,42 @@ func main() {
 		logStep("Detected local network: %s", target)
 	}
 
-	logStep("Starting network scan on %s with nmap...", target)
-	// Run nmap command
-	cmd := exec.Command("nmap", "-sV", "--open", "-F", target)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Error running nmap: %v\n", err)
+	var wg sync.WaitGroup
+	var hosts []Host
+	var btDevices map[string]string
+	var nmapErr error
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		logStep("Starting network scan on %s with nmap...", target)
+		// Run nmap command
+		cmd := exec.Command("nmap", "-sV", "--open", "-F", target)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			nmapErr = fmt.Errorf("Error running nmap: %v", err)
+			return
+		}
+
+		logStep("Network scan completed, parsing %d bytes of output...", len(output))
+		hosts = parseNmapOutput(string(output))
+		logStep("Found %d hosts with open ports", len(hosts))
+	}()
+
+	go func() {
+		defer wg.Done()
+		// Get Bluetooth devices
+		btDevices = getBluetoothDevices()
+	}()
+
+	logStep("Waiting for scans to complete in parallel...")
+	wg.Wait()
+
+	if nmapErr != nil {
+		fmt.Println(nmapErr)
 		os.Exit(1)
 	}
-
-	logStep("Network scan completed, parsing %d bytes of output...", len(output))
-	hosts := parseNmapOutput(string(output))
-	logStep("Found %d hosts with open ports", len(hosts))
-
-	// Get Bluetooth devices
-	btDevices := getBluetoothDevices()
 
 	logStep("Matching Bluetooth devices with network hosts...")
 	// Match Bluetooth devices with scanned hosts
@@ -322,8 +344,8 @@ func main() {
 
 	logStep("Displaying results...\n")
 	// Print header
-	fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n", "IP", "MAC", "Hostname", "OS", "Ports", "Version", "Device")
-	fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n", "---", "---", "--------", "--", "-----", "-------", "-----")
+	fmt.Printf("%-15s %-17s %-10s %-25s %-25s %s\n", "IP", "MAC", "OS", "Ports", "Version", "Device")
+	fmt.Printf("%-15s %-17s %-10s %-25s %-25s %s\n", "---", "---", "--", "-----", "-------", "-----")
 
 	// Print each host
 	for _, h := range hosts {
@@ -335,17 +357,16 @@ func main() {
 		if versionStr == "" {
 			versionStr = "(no OS)"
 		}
-		fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n",
+		fmt.Printf("%-15s %-17s %-10s %-25s %-25s %s\n",
 			h.IP,
 			h.MAC,
-			h.Hostname,
 			h.OS,
 			portsStr,
 			versionStr,
 			deviceTypeEmoji(h))
 		// Print Bluetooth name below if available
 		if h.BluetoothName != "" {
-			fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s (Bluetooth: %s)\n", "", "", "", "", "", "", h.BluetoothName)
+			fmt.Printf("%-15s %-17s %-10s %-25s %-25s (Bluetooth: %s)\n", "", "", "", "", "", h.BluetoothName)
 		}
 	}
 }
