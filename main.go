@@ -1,0 +1,351 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"flag"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"regexp"
+	"strings"
+	"time"
+)
+
+var disableLogs bool
+
+func init() {
+	// The user asked for logs "which can be disabled with the verbose flag"
+	// So we use -v to disable the logs, making them enabled by default.
+	flag.BoolVar(&disableLogs, "v", false, "Disable verbose logs for different steps")
+}
+
+func logStep(format string, args ...interface{}) {
+	if !disableLogs {
+		fmt.Printf("[*] "+format+"\n", args...)
+	}
+}
+
+// Host represents a network device
+type Host struct {
+	IP           string
+	MAC          string
+	Hostname     string
+	OS           string
+	Ports        []string
+	Version      string
+	BluetoothName string
+}
+
+// deviceTypeEmoji returns an emoji based on host characteristics
+func deviceTypeEmoji(h Host) string {
+	// Check for mobile phone indicators
+	if strings.Contains(strings.ToLower(h.Hostname), "phone") ||
+		strings.Contains(strings.ToLower(h.Hostname), "android") ||
+		strings.Contains(strings.ToLower(h.Hostname), "iphone") ||
+		strings.Contains(strings.ToLower(h.OS), "android") ||
+		strings.Contains(strings.ToLower(h.OS), "ios") {
+		return "📱"
+	}
+
+	// Check for television indicators
+	if strings.Contains(strings.ToLower(h.Hostname), "tv") ||
+		strings.Contains(strings.ToLower(h.Hostname), "smarttv") ||
+		strings.Contains(strings.ToLower(h.OS), "tizen") ||
+		strings.Contains(strings.ToLower(h.OS), "webos") ||
+		strings.Contains(strings.ToLower(h.OS), "roku") {
+		return "📺"
+	}
+
+	// Check for router/switch indicators
+	if strings.Contains(strings.ToLower(h.Hostname), "router") ||
+		strings.Contains(strings.ToLower(h.Hostname), "gateway") ||
+		strings.Contains(strings.ToLower(h.Hostname), "switch") ||
+		strings.Contains(strings.ToLower(h.Hostname), "ap") ||
+		strings.Contains(strings.ToLower(h.OS), "router") ||
+		strings.Contains(strings.ToLower(h.OS), "linux") && len(h.Ports) > 5 { // Heuristic: many ports might indicate router
+		// Additional check for common router vendors in MAC (we don't have vendor parsed, but we can check MAC prefixes later)
+		return "🖧"
+	}
+
+	// Check for computer indicators
+	if strings.Contains(strings.ToLower(h.Hostname), "computer") ||
+		strings.Contains(strings.ToLower(h.Hostname), "pc") ||
+		strings.Contains(strings.ToLower(h.Hostname), "mac") ||
+		strings.Contains(strings.ToLower(h.Hostname), "windows") ||
+		strings.Contains(strings.ToLower(h.OS), "windows") ||
+		strings.Contains(strings.ToLower(h.OS), "macos") ||
+		strings.Contains(strings.ToLower(h.OS), "linux") && !strings.Contains(strings.ToLower(h.Hostname), "tv") {
+		return "💻"
+	}
+
+	// Default to unknown
+	return "❓"
+}
+
+// parseNmapOutput parses the text output of nmap -sV --open -F
+func parseNmapOutput(output string) []Host {
+	var hosts []Host
+	var currentHost *Host
+	inPorts := false
+
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		// Skip empty lines
+		if trimmed == "" {
+			inPorts = false
+			continue
+		}
+
+		// New host entry
+		if strings.HasPrefix(trimmed, "Nmap scan report for") {
+			if currentHost != nil {
+				hosts = append(hosts, *currentHost)
+			}
+			currentHost = &Host{}
+			inPorts = false
+
+			// Extract hostname and IP
+			// Format: "Nmap scan report for hostname (ip)" or "Nmap scan report for ip"
+			parts := strings.Split(trimmed, " ")
+			if len(parts) >= 5 {
+				// Check if last part is parentheses
+				lastPart := parts[len(parts)-1]
+				if strings.HasPrefix(lastPart, "(") && strings.HasSuffix(lastPart, ")") {
+					currentHost.Hostname = strings.Join(parts[4:len(parts)-1], " ")
+					currentHost.IP = strings.Trim(lastPart, "()")
+				} else {
+					currentHost.Hostname = "" // No hostname provided
+					currentHost.IP = strings.Join(parts[4:], " ")
+				}
+			}
+			continue
+		}
+
+		if currentHost == nil {
+			continue
+		}
+
+		// MAC address
+		if strings.HasPrefix(trimmed, "MAC Address:") {
+			// Format: "MAC Address: AA:BB:CC:DD:EE:FF (Vendor)"
+			macParts := strings.Split(trimmed, " ")
+			if len(macParts) >= 3 {
+				currentHost.MAC = macParts[2]
+				// Optionally extract vendor from parentheses
+			}
+			continue
+		}
+
+		// OS detection from Service Info
+		if strings.HasPrefix(trimmed, "Service Info:") {
+			// Format: "Service Info: OS: OS; CPE: ..."
+			osMatch := regexp.MustCompile(`OS: ([^;]+)`).FindStringSubmatch(trimmed)
+			if len(osMatch) >= 2 {
+				currentHost.OS = strings.TrimSpace(osMatch[1])
+			}
+			// Also extract version/service info
+			versionMatch := regexp.MustCompile(`Service Info: (.+)`).FindStringSubmatch(trimmed)
+			if len(versionMatch) >= 2 {
+				fullInfo := strings.TrimSpace(versionMatch[1])
+				// Extract just the service/version part after OS
+				if osPart := regexp.MustCompile(`OS: [^;]+`).FindString(fullInfo); osPart != "" {
+					serviceInfo := strings.TrimPrefix(fullInfo, osPart)
+					serviceInfo = strings.Trim(serviceInfo, "; ")
+					if serviceInfo != "" {
+						currentHost.Version = serviceInfo
+					}
+				} else {
+					currentHost.Version = fullInfo
+				}
+			}
+			continue
+		}
+
+		// Port header
+		if strings.HasPrefix(trimmed, "PORT") && strings.Contains(trimmed, "STATE") {
+			inPorts = true
+			continue
+		}
+
+		// Port entries
+		if inPorts && currentHost != nil {
+			// Format: "22/tcp   open  ssh     OpenSSH 7.9p1 Debian 10+deb10u2 (protocol 2.0)"
+			if strings.Contains(trimmed, "/tcp") || strings.Contains(trimmed, "/udp") {
+				portParts := strings.Fields(trimmed)
+				if len(portParts) >= 2 {
+					currentHost.Ports = append(currentHost.Ports, portParts[0])
+				}
+			}
+			continue
+		}
+	}
+
+	// Add the last host
+	if currentHost != nil {
+		hosts = append(hosts, *currentHost)
+	}
+
+	return hosts
+}
+
+// getBluetoothDevices executes sudo btmgmt find and returns a map of MAC to device name
+func getBluetoothDevices() map[string]string {
+	btMap := make(map[string]string)
+	// Check if btmgmt exists
+	if _, err := exec.LookPath("btmgmt"); err != nil {
+		// btmgmt not found, return empty map
+		return btMap
+	}
+
+	logStep("Starting Bluetooth scan (5 seconds)...")
+
+	// Run sudo btmgmt find with a timeout because it never exits on its own
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sudo", "btmgmt", "find")
+	output, err := cmd.CombinedOutput()
+
+	// We expect an error (context deadline exceeded) when the timeout hits.
+	// But we still process whatever output was gathered.
+	if err != nil && ctx.Err() == nil {
+		// Command failed for reasons other than timeout (maybe no sudo permissions)
+		logStep("Bluetooth scan failed: %v", err)
+		return btMap
+	}
+
+	logStep("Bluetooth scan completed, parsing %d bytes of output...", len(output))
+
+	// Parse output
+	// Example line: [hci0] device456789: 11:22:33:44:55:66 (public) name: MyPhone
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Look for lines containing a MAC address and a name
+		if strings.Contains(line, "name:") {
+			// Extract MAC address (pattern: XX:XX:XX:XX:XX:XX)
+			parts := strings.Fields(line)
+			var mac string
+			var name string
+			for i, part := range parts {
+				if strings.Contains(part, ":") && len(part) == 17 { // MAC length
+					mac = part
+					// Look for the "name:" field
+					for j := i; j < len(parts); j++ {
+						if parts[j] == "name:" && j+1 < len(parts) {
+							name = strings.Join(parts[j+1:], " ")
+							break
+						}
+					}
+					break
+				}
+			}
+			if mac != "" && name != "" {
+				// Normalize MAC to lowercase for consistent comparison
+				btMap[strings.ToLower(mac)] = name
+			}
+		}
+	}
+	logStep("Found %d Bluetooth devices", len(btMap))
+	return btMap
+}
+
+// getLocalNetwork attempts to auto-detect the local network CIDR
+func getLocalNetwork() string {
+	// Simple approach: get first non-loopback IPv4 address and assume /24
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		if ipv4 := ip.To4(); ipv4 != nil {
+			// Assume /24 subnet
+			return fmt.Sprintf("%s.0/24", strings.Join(strings.Split(ipv4.String(), ".")[:3], "."))
+		}
+	}
+	return ""
+}
+
+func main() {
+	flag.Parse()
+
+	var target string
+	if flag.NArg() > 0 {
+		target = flag.Arg(0)
+	} else {
+		target = getLocalNetwork()
+		if target == "" {
+			fmt.Println("Error: Could not auto-detect network. Please provide a target (e.g., 192.168.1.0/24)")
+			os.Exit(1)
+		}
+		logStep("Detected local network: %s", target)
+	}
+
+	logStep("Starting network scan on %s with nmap...", target)
+	// Run nmap command
+	cmd := exec.Command("nmap", "-sV", "--open", "-F", target)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Error running nmap: %v\n", err)
+		os.Exit(1)
+	}
+
+	logStep("Network scan completed, parsing %d bytes of output...", len(output))
+	hosts := parseNmapOutput(string(output))
+	logStep("Found %d hosts with open ports", len(hosts))
+
+	// Get Bluetooth devices
+	btDevices := getBluetoothDevices()
+
+	logStep("Matching Bluetooth devices with network hosts...")
+	// Match Bluetooth devices with scanned hosts
+	for i := range hosts {
+		if btName, found := btDevices[strings.ToLower(hosts[i].MAC)]; found {
+			hosts[i].BluetoothName = btName
+		}
+	}
+
+	logStep("Displaying results...\n")
+	// Print header
+	fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n", "IP", "MAC", "Hostname", "OS", "Ports", "Version", "Device")
+	fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n", "---", "---", "--------", "--", "-----", "-------", "-----")
+
+	// Print each host
+	for _, h := range hosts {
+		portsStr := strings.Join(h.Ports, ",")
+		if portsStr == "" {
+			portsStr = "none"
+		}
+		versionStr := h.Version
+		if versionStr == "" {
+			versionStr = "(no OS)"
+		}
+		fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s %s\n",
+			h.IP,
+			h.MAC,
+			h.Hostname,
+			h.OS,
+			portsStr,
+			versionStr,
+			deviceTypeEmoji(h))
+		// Print Bluetooth name below if available
+		if h.BluetoothName != "" {
+			fmt.Printf("%-15s %-17s %-20s %-10s %-25s %-25s (Bluetooth: %s)\n", "", "", "", "", "", "", h.BluetoothName)
+		}
+	}
+}
