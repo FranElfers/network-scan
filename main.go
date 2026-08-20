@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"net"
@@ -41,7 +42,7 @@ type Host struct {
 
 // deviceTypeEmoji returns an emoji based on host characteristics
 func deviceTypeEmoji(h Host) string {
-	if h.IP == "(BT only)" {
+	if h.IP == "BT only" {
 		return "📡"
 	}
 
@@ -89,7 +90,7 @@ func deviceTypeEmoji(h Host) string {
 	return "❓"
 }
 
-// parseNmapOutput parses the text output of nmap -sV --open -F
+// parseNmapOutput parses the text output of nmap -sV -F
 func parseNmapOutput(output string) []Host {
 	var hosts []Host
 	var currentHost *Host
@@ -319,22 +320,41 @@ func main() {
 		defer wg.Done()
 		logStep("Starting quick ping sweep on %s...", target)
 
-		// Run nmap ping sweep to find live hosts quickly
-		cmd := exec.Command("nmap", "-sn", "-oG", "-", target)
+		// Run nmap ping sweep to find live hosts quickly (XML output for robust parsing)
+		cmd := exec.Command("nmap", "-sn", "-oX", "-", target)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			nmapErr = fmt.Errorf("Error running nmap ping sweep: %v", err)
 			return
 		}
 
+		type NmapRun struct {
+			XMLName xml.Name `xml:"nmaprun"`
+			Hosts   []struct {
+				Status struct {
+					State string `xml:"state,attr"`
+				} `xml:"status"`
+				Addresses []struct {
+					Addr string `xml:"addr,attr"`
+					Type string `xml:"addrtype,attr"`
+				} `xml:"address"`
+			} `xml:"host"`
+		}
+
+		var run NmapRun
+		if err := xml.Unmarshal(output, &run); err != nil {
+			nmapErr = fmt.Errorf("Error parsing nmap XML output: %v", err)
+			return
+		}
+
 		var ips []string
-		scanner := bufio.NewScanner(strings.NewReader(string(output)))
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "Host: ") && strings.Contains(line, "Status: Up") {
-				parts := strings.Split(line, " ")
-				if len(parts) >= 2 {
-					ips = append(ips, parts[1])
+		for _, host := range run.Hosts {
+			if host.Status.State == "up" {
+				for _, addr := range host.Addresses {
+					if addr.Type == "ipv4" {
+						ips = append(ips, addr.Addr)
+						break
+					}
 				}
 			}
 		}
@@ -388,9 +408,10 @@ func main() {
 	for mac, btName := range btDevices {
 		if !matchedBT[mac] {
 			hosts = append(hosts, Host{
-				IP:            "(BT only)",
+				IP:            "BT only",
 				MAC:           strings.ToUpper(mac),
-				BluetoothName: btName,
+				Version:       btName,
+				BluetoothName: "", // Clear this so it doesn't print a second line
 			})
 		}
 	}
@@ -418,7 +439,7 @@ func main() {
 			deviceTypeEmoji(h))
 		// Print Bluetooth name below if available
 		if h.BluetoothName != "" {
-			fmt.Printf("%-15s %-17s %-10s %-25s %-25s (Bluetooth: %s)\n", "", "", "", "", "", h.BluetoothName)
+			fmt.Printf("%-15s %-17s %-10s %-25s %-25s\n", "", "", "", "", h.BluetoothName)
 		}
 	}
 }
