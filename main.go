@@ -41,6 +41,10 @@ type Host struct {
 
 // deviceTypeEmoji returns an emoji based on host characteristics
 func deviceTypeEmoji(h Host) string {
+	if h.IP == "(BT only)" {
+		return "📡"
+	}
+
 	// Check for mobile phone indicators
 	if strings.Contains(strings.ToLower(h.Hostname), "phone") ||
 		strings.Contains(strings.ToLower(h.Hostname), "android") ||
@@ -210,7 +214,7 @@ func getBluetoothDevices() map[string]string {
 	// That way, when the 10-second timeout forcefully kills it, we've captured the output.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	cmd := exec.CommandContext(ctx, "script", "-q", "-c", "sudo btmgmt find", "/dev/null")
 	output, err := cmd.CombinedOutput()
 
@@ -219,8 +223,6 @@ func getBluetoothDevices() map[string]string {
 		logStep("Bluetooth scan failed: %v", err)
 		return btMap
 	}
-
-	logStep("Bluetooth scan completed, parsing %d bytes of output...", len(output))
 
 	// Parse output
 	// Newer btmgmt versions output MAC and name on different lines:
@@ -304,7 +306,6 @@ func main() {
 			fmt.Println("Error: Could not auto-detect network. Please provide a target (e.g., 192.168.1.0/24)")
 			os.Exit(1)
 		}
-		logStep("Detected local network: %s", target)
 	}
 
 	var wg sync.WaitGroup
@@ -316,16 +317,45 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		logStep("Starting network scan on %s with nmap...", target)
-		// Run nmap command
-		cmd := exec.Command("nmap", "-sV", "--open", "-F", target)
+		logStep("Starting quick ping sweep on %s...", target)
+
+		// Run nmap ping sweep to find live hosts quickly
+		cmd := exec.Command("nmap", "-sn", "-oG", "-", target)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			nmapErr = fmt.Errorf("Error running nmap: %v", err)
+			nmapErr = fmt.Errorf("Error running nmap ping sweep: %v", err)
 			return
 		}
 
-		logStep("Network scan completed, parsing %d bytes of output...", len(output))
+		var ips []string
+		scanner := bufio.NewScanner(strings.NewReader(string(output)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "Host: ") && strings.Contains(line, "Status: Up") {
+				parts := strings.Split(line, " ")
+				if len(parts) >= 2 {
+					ips = append(ips, parts[1])
+				}
+			}
+		}
+
+		if len(ips) == 0 {
+			logStep("No live hosts found in ping sweep.")
+			return
+		}
+
+		logStep("Found %d live hosts. Starting deep scan on them...", len(ips))
+
+		// Run detailed scan only on live IPs
+		args := []string{"-sV", "--open", "-F"}
+		args = append(args, ips...)
+		cmd = exec.Command("nmap", args...)
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			nmapErr = fmt.Errorf("Error running detailed nmap scan: %v\nOutput: %s", err, string(output))
+			return
+		}
+
 		hosts = parseNmapOutput(string(output))
 		logStep("Found %d hosts with open ports", len(hosts))
 	}()
@@ -336,7 +366,6 @@ func main() {
 		btDevices = getBluetoothDevices()
 	}()
 
-	logStep("Waiting for scans to complete in parallel...")
 	wg.Wait()
 
 	if nmapErr != nil {
@@ -346,13 +375,26 @@ func main() {
 
 	logStep("Matching Bluetooth devices with network hosts...")
 	// Match Bluetooth devices with scanned hosts
+	matchedBT := make(map[string]bool)
 	for i := range hosts {
-		if btName, found := btDevices[strings.ToLower(hosts[i].MAC)]; found {
+		macLower := strings.ToLower(hosts[i].MAC)
+		if btName, found := btDevices[macLower]; found {
 			hosts[i].BluetoothName = btName
+			matchedBT[macLower] = true
 		}
 	}
 
-	logStep("Displaying results...\n")
+	// Add unmatched Bluetooth devices to the list
+	for mac, btName := range btDevices {
+		if !matchedBT[mac] {
+			hosts = append(hosts, Host{
+				IP:            "(BT only)",
+				MAC:           strings.ToUpper(mac),
+				BluetoothName: btName,
+			})
+		}
+	}
+
 	// Print header
 	fmt.Printf("%-15s %-17s %-10s %-25s %-25s %s\n", "IP", "MAC", "OS", "Ports", "Version", "Device")
 	fmt.Printf("%-15s %-17s %-10s %-25s %-25s %s\n", "---", "---", "--", "-----", "-------", "-----")
