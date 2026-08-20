@@ -4,18 +4,10 @@ Ultra-lightweight CLI scanner in Go. Map your local network (nmap) and Bluetooth
 
 ## Features
 
-- Scans local network using nmap
-- Detects Bluetooth devices using `sudo btmgmt find`
+- Scans local network using `nmap`
+- Detects Bluetooth devices using `btmgmt`
 - Matches Bluetooth MAC addresses with network scan results
 - Displays IP address, MAC address, hostname, OS, version info, and open ports
-- Identifies device types with emojis:
-  - 📱 Mobile phone
-  - 💻 Computer
-  - 📺 Television
-  - 🖧 Router or switch
-  - ❓ Unknown device
-- Shows Bluetooth device names when MAC addresses match
-- Simple command-line interface
 - Auto-detects local network when possible
 
 ## Requirements
@@ -66,35 +58,9 @@ IP              MAC               Hostname             OS              Ports    
                     (Bluetooth: EPSON Printer)
 ```
 
-## How It Works
-
-1. The tool uses nmap with flags `-sV --open -F` to:
-   - `-sV`: Probe open ports to determine service/version info
-   - `--open`: Only show hosts with open ports
-   - `-F`: Fast mode (scans fewer ports than default)
-
-2. Parses nmap's text output to extract device information including MAC addresses
-
-3. Executes `sudo btmgmt find` to discover Bluetooth devices and their MAC addresses
-
-4. Matches Bluetooth MAC addresses with those found in the network scan
-
-5. Applies heuristics to determine device type based on:
-   - Hostname patterns
-   - Operating system strings
-   - Port characteristics (for routers)
-
-6. Displays results in a formatted table with emoji device indicators
-7. Shows Bluetooth device names indented below matching entries
-
 ## Notes
 
-- Requires root/administrator privileges for nmap scanning and Bluetooth scanning
 - Scan time depends on network size and nmap options
 - Bluetooth detection requires a working Bluetooth adapter and proper permissions
 - Device detection is heuristic-based and may not be 100% accurate
 - For best results, run on your local network segment
-
-## License
-
-MIT
