@@ -30,12 +30,12 @@ func logStep(format string, args ...interface{}) {
 
 // Host represents a network device
 type Host struct {
-	IP           string
-	MAC          string
-	Hostname     string
-	OS           string
-	Ports        []string
-	Version      string
+	IP            string
+	MAC           string
+	Hostname      string
+	OS            string
+	Ports         []string
+	Version       string
 	BluetoothName string
 }
 
@@ -203,19 +203,19 @@ func getBluetoothDevices() map[string]string {
 		return btMap
 	}
 
-	logStep("Starting Bluetooth scan (5 seconds)...")
+	logStep("Starting Bluetooth scan (10 seconds)...")
 
-	// Run sudo btmgmt find with a timeout because it never exits on its own
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// We use 'script' to allocate a pseudo-tty (PTY). This tricks btmgmt into thinking
+	// it's connected to a real terminal, so it natively line-buffers its output.
+	// That way, when the 10-second timeout forcefully kills it, we've captured the output.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "sudo", "btmgmt", "find")
+	
+	cmd := exec.CommandContext(ctx, "script", "-q", "-c", "sudo btmgmt find", "/dev/null")
 	output, err := cmd.CombinedOutput()
 
-	// We expect an error (context deadline exceeded) when the timeout hits.
-	// But we still process whatever output was gathered.
+	// If it was just a timeout, we proceed to parse the output we captured.
 	if err != nil && ctx.Err() == nil {
-		// Command failed for reasons other than timeout (maybe no sudo permissions)
 		logStep("Bluetooth scan failed: %v", err)
 		return btMap
 	}
@@ -223,36 +223,46 @@ func getBluetoothDevices() map[string]string {
 	logStep("Bluetooth scan completed, parsing %d bytes of output...", len(output))
 
 	// Parse output
-	// Example line: [hci0] device456789: 11:22:33:44:55:66 (public) name: MyPhone
+	// Newer btmgmt versions output MAC and name on different lines:
+	// hci0 dev_found: F8:3F:51:78:BB:09 type LE Public rssi -79 flags 0x0020
+	// name [TV] Samsung 6 Series (55)
+
+	macRegex := regexp.MustCompile(`(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}`)
+	var currentMAC string
+
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Look for lines containing a MAC address and a name
-		if strings.Contains(line, "name:") {
-			// Extract MAC address (pattern: XX:XX:XX:XX:XX:XX)
-			parts := strings.Fields(line)
-			var mac string
-			var name string
-			for i, part := range parts {
-				if strings.Contains(part, ":") && len(part) == 17 { // MAC length
-					mac = part
-					// Look for the "name:" field
-					for j := i; j < len(parts); j++ {
-						if parts[j] == "name:" && j+1 < len(parts) {
-							name = strings.Join(parts[j+1:], " ")
-							break
-						}
-					}
-					break
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.HasPrefix(line, "name ") {
+			if currentMAC != "" {
+				name := strings.TrimSpace(strings.TrimPrefix(line, "name "))
+				if name != "" {
+					btMap[strings.ToLower(currentMAC)] = name
 				}
 			}
-			if mac != "" && name != "" {
-				// Normalize MAC to lowercase for consistent comparison
-				btMap[strings.ToLower(mac)] = name
+		} else if strings.Contains(line, "name:") {
+			// Old format fallback: "[hci0] ... 11:22:33... name: MyPhone"
+			mac := macRegex.FindString(line)
+			if mac != "" {
+				parts := strings.SplitN(line, "name:", 2)
+				if len(parts) == 2 {
+					name := strings.TrimSpace(parts[1])
+					if name != "" {
+						btMap[strings.ToLower(mac)] = name
+					}
+				}
+			}
+		} else {
+			// Update current MAC from dev_found or similar lines
+			mac := macRegex.FindString(line)
+			if mac != "" {
+				currentMAC = mac
 			}
 		}
 	}
-	logStep("Found %d Bluetooth devices", len(btMap))
+
+	logStep("Found %d named Bluetooth devices", len(btMap))
 	return btMap
 }
 
