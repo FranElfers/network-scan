@@ -367,7 +367,7 @@ func main() {
 		logStep("Found %d live hosts. Starting deep scan on them...", len(ips))
 
 		// Run detailed scan only on live IPs
-		args := []string{"-sV", "--open", "-F"}
+		args := []string{"-n", "-sV", "--version-light", "-T4", "--top-ports", "50", "--max-retries", "1", "-F"}
 		args = append(args, ips...)
 		cmd = exec.Command("nmap", args...)
 		output, err = cmd.CombinedOutput()
