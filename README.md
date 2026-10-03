@@ -26,7 +26,7 @@ Ultra-lightweight CLI scanner in Go. Map your local network (nmap) and Bluetooth
 5. Build the program:
 
 ```bash
-go build main.go
+go build .
 ```
 
 ## Usage
