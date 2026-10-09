@@ -1,66 +1,58 @@
 # Network Device Scanner
 
-Ultra-lightweight CLI scanner in Go. Map your local network (nmap) and Bluetooth devices (btmgmt), identifying each device with emojis according to its MAC and Operating System.
+Lightweight CLI scanner in Go. Maps your local network (nmap) and nearby Bluetooth devices (btmgmt), and labels each device with an emoji based on its OS, open ports and MAC address.
 
 ## Features
 
-- Scans local network using `nmap`
-- Detects Bluetooth devices using `btmgmt`
-- Matches Bluetooth MAC addresses with network scan results
-- Displays IP address, MAC address, hostname, OS, version info, and open ports
-- Auto-detects local network when possible
+- One nmap run: host discovery, top-50 port scan, service versions and OS fingerprinting (`-O`)
+- Host names via mDNS (unicast reverse lookup), falling back to NetBIOS
+- Device type heuristics: default gateway / router 🖧, phone 📱, TV 📺, IP camera (RTSP) 📷, computer 💻
+- Phones that hide behind a randomized Wi-Fi MAC are flagged as probable phones 📱?
+- Lists named Bluetooth devices (in a separate section, since Bluetooth and Wi-Fi MACs differ)
+- Auto-detects the network of the default-route interface
 
 ## Requirements
 
-- Go 1.16+ (tested with 1.27.0)
-- nmap installed and accessible in PATH
-- Bluetooth adapter with btmgmt utility (BlueZ stack)
-- sudo privileges for Bluetooth scanning
+- Linux (reads `/proc/net/route`)
+- Go 1.27+
+- `nmap` in PATH
+- Root (nmap needs it for MAC addresses and OS detection; the program exits otherwise)
+- Optional: BlueZ `btmgmt` and `script` (util-linux) for Bluetooth. Skipped if `btmgmt` is missing.
 
-## Installation
-
-1. Clone or download this repository
-2. Install Go if not already installed
-3. Ensure nmap is installed (`sudo apt-get install nmap` on Ubuntu/Debian)
-4. Ensure Bluetooth utilities are installed (`sudo apt-get install bluetooth bluez` on Ubuntu/Debian)
-5. Build the program:
+## Build
 
 ```bash
-go build .
+go build .   # produces ./network-scan
+go test .
 ```
 
 ## Usage
 
-### Basic Usage
-
-Run without arguments to auto-detect your local network:
-
 ```bash
-./main
+sudo ./network-scan                   # auto-detect network
+sudo ./network-scan 192.168.1.0/24    # explicit target
+sudo ./network-scan -mac              # also show MAC addresses
+sudo ./network-scan -v                # hide the [*] progress logs
 ```
 
-Or specify a target network/CIDR:
+Auto-detection uses the subnet of the default-route interface, narrowed to a `/24` around your IP when the subnet is larger. Pass a CIDR to scan something else.
 
-```bash
-./main 192.168.1.0/24
-```
-
-### Example Output
+### Example output
 
 ```
-IP              MAC               Hostname             OS              Ports                Version                                 Device
----             ---               --------             --              -----                -------                                 -----
-192.168.1.1     AA:BB:CC:DD:EE:FF gateway              Linux           22/tcp,80/tcp      http config (microhttpd)            🖧
-192.168.1.100   11:22:33:44:55:66 myphone              Android         80/tcp,443/tcp      Android SDK built for x86           📱
-                    (Bluetooth: MyPhone)
-192.168.1.101   AA:BB:CC:DD:EE:00 DESKTOP-ABC123       Windows 10      135/tcp,139/tcp     Microsoft Windows                     💻
-192.168.1.47    AA:BB:CC:DD:EE:99 EPSON023180          (no OS)         80/tcp              Epson Stylus NX230 printer UPnP       📺
-                    (Bluetooth: EPSON Printer)
+IP              Name                 OS                        Ports                     Version                   Device
+---             ----                 --                        -----                     -------                   -----
+192.168.100.1                        Linux 3.10 - 4.11         53/tcp,80/tcp,49152/tcp   -                         🖧
+192.168.100.13                       Linux 3.2 - 4.14          80/tcp,554/tcp            -                         📷
+192.168.100.68                                                 none                      -                         📱?
+192.168.100.230 lenovo               Linux 5.0 - 6.2           22/tcp                    OpenSSH 10.6              💻
+
+📡 Bluetooth
+Mi Smart Band 4
 ```
 
 ## Notes
 
-- Scan time depends on network size and nmap options
-- Bluetooth detection requires a working Bluetooth adapter and proper permissions
-- Device detection is heuristic-based and may not be 100% accurate
-- For best results, run on your local network segment
+- Device detection is heuristic and can be wrong; phones usually expose no open ports, so 📱? (randomized MAC) is often the only signal.
+- A phone shows up over Bluetooth only while its Bluetooth settings screen is open.
+- Scan time grows with network size; OS detection adds a few seconds per host.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 
 // -v disables the [*] step logs (enabled by default).
 var disableLogs = flag.Bool("v", false, "Disable verbose logs for different steps")
+var showMAC = flag.Bool("mac", false, "Show the MAC address column")
 
 func logStep(format string, args ...interface{}) {
 	if !*disableLogs {
@@ -28,15 +31,14 @@ func logStep(format string, args ...interface{}) {
 
 // Host represents a network device
 type Host struct {
-	IP            string
-	MAC           string
-	Name          string // from mDNS or NetBIOS
-	OS            string
-	OSType        string // nmap OS class type, e.g. "phone", "router"
-	Ports         []string
-	Version       string
-	BluetoothName string
-	Gateway       bool // host is this machine's default gateway
+	IP      string
+	MAC     string
+	Name    string // from mDNS or NetBIOS
+	OS      string
+	OSType  string // nmap OS class type, e.g. "phone", "router"
+	Ports   []string
+	Version string
+	Gateway bool // host is this machine's default gateway
 }
 
 func (h Host) hasPort(port string) bool {
@@ -60,8 +62,6 @@ func deviceTypeEmoji(h Host) string {
 		return false
 	}
 	switch {
-	case h.IP == "BT only":
-		return "📡"
 	case h.Gateway:
 		return "🖧"
 	case h.OSType == "phone" || has("android", "ios"):
@@ -160,7 +160,7 @@ func scanNetwork(target string) ([]Host, error) {
 	return hosts, nil
 }
 
-// getBluetoothDevices executes sudo btmgmt find and returns a map of MAC to device name
+// getBluetoothDevices runs btmgmt find and returns a map of lowercase MAC to device name.
 func getBluetoothDevices() map[string]string {
 	btMap := make(map[string]string)
 	// Check if btmgmt exists
@@ -186,13 +186,22 @@ func getBluetoothDevices() map[string]string {
 		return btMap
 	}
 
-	// btmgmt prints MAC and name on different lines:
-	// hci0 dev_found: F8:3F:51:78:BB:09 type LE Public rssi -79 flags 0x0020
-	// name [TV] Samsung 6 Series (55)
-	macRegex := regexp.MustCompile(`(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}`)
+	btMap = parseBtmgmt(string(output))
+	logStep("Found %d named Bluetooth devices", len(btMap))
+	return btMap
+}
+
+var macRegex = regexp.MustCompile(`(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}`)
+
+// parseBtmgmt extracts named devices from btmgmt find output, which prints MAC and name on different lines:
+//
+//	hci0 dev_found: F8:3F:51:78:BB:09 type LE Public rssi -79 flags 0x0020
+//	name [TV] Samsung 6 Series (55)
+func parseBtmgmt(output string) map[string]string {
+	btMap := make(map[string]string)
 	var currentMAC string
 
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
@@ -204,8 +213,6 @@ func getBluetoothDevices() map[string]string {
 			currentMAC = mac
 		}
 	}
-
-	logStep("Found %d named Bluetooth devices", len(btMap))
 	return btMap
 }
 
@@ -277,7 +284,11 @@ func mdnsName(ip string) string {
 	}
 	q = append(q, 0, 0, 12, 0, 1) // PTR, IN
 
-	resp := udpQuery(ip+":5353", q)
+	return parseMDNSPTR(udpQuery(ip+":5353", q))
+}
+
+// parseMDNSPTR returns the first PTR answer in a DNS response, without the .local suffix.
+func parseMDNSPTR(resp []byte) string {
 	if len(resp) < 12 || binary.BigEndian.Uint16(resp[6:]) == 0 {
 		return ""
 	}
@@ -308,7 +319,11 @@ func netbiosName(ip string) string {
 	}
 	q = append(q, 0, 0, 0x21, 0, 1) // NBSTAT, IN
 
-	resp := udpQuery(ip+":137", q)
+	return parseNBStat(udpQuery(ip+":137", q))
+}
+
+// parseNBStat returns the unique workstation (<00>) name from a NetBIOS node status response.
+func parseNBStat(resp []byte) string {
 	if len(resp) < 12 {
 		return ""
 	}
@@ -344,13 +359,19 @@ func resolveNames(hosts []Host) {
 	wg.Wait()
 }
 
-// defaultGateway returns the IPv4 default gateway from /proc/net/route, or "" if unknown.
-func defaultGateway() string {
+// defaultRoute returns the interface and gateway of the IPv4 default route from /proc/net/route.
+func defaultRoute() (iface, gateway string) {
 	data, err := os.ReadFile("/proc/net/route")
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	for _, line := range strings.Split(string(data), "\n")[1:] {
+	return parseDefaultRoute(string(data))
+}
+
+// parseDefaultRoute parses /proc/net/route contents (addresses are hex in little-endian byte order).
+func parseDefaultRoute(data string) (iface, gateway string) {
+	lines := strings.Split(data, "\n")
+	for _, line := range lines[min(1, len(lines)):] {
 		f := strings.Fields(line)
 		if len(f) < 3 || f[1] != "00000000" {
 			continue
@@ -359,29 +380,51 @@ func defaultGateway() string {
 		if _, err := fmt.Sscanf(f[2], "%x", &gw); err != nil || gw == 0 {
 			continue
 		}
-		// /proc/net/route stores addresses in host (little-endian) byte order.
-		return net.IPv4(byte(gw), byte(gw>>8), byte(gw>>16), byte(gw>>24)).String()
+		return f[0], net.IPv4(byte(gw), byte(gw>>8), byte(gw>>16), byte(gw>>24)).String()
+	}
+	return "", ""
+}
+
+// networkCIDR returns the network of ipnet, narrowed to the /24 around its IP when the
+// subnet is larger, so auto-detection never launches a /16-sized scan.
+func networkCIDR(ipnet *net.IPNet) string {
+	ones, bits := ipnet.Mask.Size()
+	if ones < 24 {
+		ones = 24
+	}
+	mask := net.CIDRMask(ones, bits)
+	return (&net.IPNet{IP: ipnet.IP.Mask(mask), Mask: mask}).String()
+}
+
+// getLocalNetwork returns the CIDR of the default-route interface, falling back to
+// the first non-loopback IPv4 interface.
+func getLocalNetwork(routeIface string) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	sort.SliceStable(ifaces, func(i, j int) bool { return ifaces[i].Name == routeIface && ifaces[j].Name != routeIface })
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				return networkCIDR(&net.IPNet{IP: ipnet.IP.To4(), Mask: ipnet.Mask[len(ipnet.Mask)-4:]})
+			}
+		}
 	}
 	return ""
 }
 
-// getLocalNetwork attempts to auto-detect the local network CIDR
-func getLocalNetwork() string {
-	// Simple approach: get first non-loopback IPv4 address and assume /24
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ""
-	}
-	for _, addr := range addrs {
-		ip, _, err := net.ParseCIDR(addr.String())
-		if err != nil || ip.IsLoopback() {
-			continue
-		}
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return fmt.Sprintf("%d.%d.%d.0/24", ipv4[0], ipv4[1], ipv4[2])
-		}
-	}
-	return ""
+// sortByIP orders hosts by numeric IPv4 address.
+func sortByIP(hosts []Host) {
+	key := func(h Host) []byte { return net.ParseIP(h.IP).To4() }
+	sort.Slice(hosts, func(i, j int) bool { return bytes.Compare(key(hosts[i]), key(hosts[j])) < 0 })
 }
 
 func main() {
@@ -392,11 +435,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	routeIface, gw := defaultRoute()
 	var target string
 	if flag.NArg() > 0 {
 		target = flag.Arg(0)
 	} else {
-		target = getLocalNetwork()
+		target = getLocalNetwork(routeIface)
 		if target == "" {
 			fmt.Println("Error: Could not auto-detect network. Please provide a target (e.g., 192.168.1.0/24)")
 			os.Exit(1)
@@ -413,7 +457,7 @@ func main() {
 		defer wg.Done()
 		if hosts, nmapErr = scanNetwork(target); nmapErr == nil {
 			resolveNames(hosts)
-			gw := defaultGateway()
+			sortByIP(hosts)
 			for i := range hosts {
 				hosts[i].Gateway = hosts[i].IP == gw
 			}
@@ -430,28 +474,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	logStep("Matching Bluetooth devices with network hosts...")
-	// Match Bluetooth devices with scanned hosts
-	matchedBT := make(map[string]bool)
-	for i := range hosts {
-		macLower := strings.ToLower(hosts[i].MAC)
-		if btName, found := btDevices[macLower]; found {
-			hosts[i].BluetoothName = btName
-			matchedBT[macLower] = true
-		}
-	}
-
-	// Add unmatched Bluetooth devices to the list
-	for mac, btName := range btDevices {
-		if !matchedBT[mac] {
-			hosts = append(hosts, Host{IP: "BT only", MAC: strings.ToUpper(mac), Version: btName})
-		}
-	}
-
 	// Print header
-	const row = "%-15s %-17s %-20s %-25s %-25s %-25s %s\n"
-	fmt.Printf(row, "IP", "MAC", "Name", "OS", "Ports", "Version", "Device")
-	fmt.Printf(row, "---", "---", "----", "--", "-----", "-------", "-----")
+	// Each row is IP, [MAC,] Name, OS, Ports, Version, Device.
+	printRow := func(ip, mac, name, os, ports, version, device string) {
+		fmt.Printf("%-15s ", ip)
+		if *showMAC {
+			fmt.Printf("%-17s ", mac)
+		}
+		fmt.Printf("%-20s %-25s %-25s %-25s %s\n", fit(name, 20), fit(os, 25), fit(ports, 25), fit(version, 25), device)
+	}
+	printRow("IP", "MAC", "Name", "OS", "Ports", "Version", "Device")
+	printRow("---", "---", "----", "--", "-----", "-------", "-----")
 
 	// Print each host
 	for _, h := range hosts {
@@ -463,10 +496,23 @@ func main() {
 		if versionStr == "" {
 			versionStr = "-"
 		}
-		fmt.Printf(row, h.IP, h.MAC, fit(h.Name, 20), fit(h.OS, 25), fit(portsStr, 25), fit(versionStr, 25), deviceTypeEmoji(h))
-		// Print Bluetooth name below if available
-		if h.BluetoothName != "" {
-			fmt.Printf(row, "", "", "", "", "", fit(h.BluetoothName, 25), "")
+		printRow(h.IP, h.MAC, h.Name, h.OS, portsStr, versionStr, deviceTypeEmoji(h))
+	}
+
+	// Bluetooth MACs never match a phone's or watch's Wi-Fi MAC, so BT devices get their own list.
+	if len(btDevices) > 0 {
+		macs := make([]string, 0, len(btDevices))
+		for mac := range btDevices {
+			macs = append(macs, mac)
+		}
+		sort.Slice(macs, func(i, j int) bool { return btDevices[macs[i]] < btDevices[macs[j]] })
+
+		fmt.Println("\n📡 Bluetooth")
+		for _, mac := range macs {
+			if *showMAC {
+				fmt.Printf("%-17s ", strings.ToUpper(mac))
+			}
+			fmt.Println(btDevices[mac])
 		}
 	}
 }
